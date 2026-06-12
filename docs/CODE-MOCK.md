@@ -870,7 +870,29 @@ API 路由的持久化调用点：
 
 ### 9.3 修复项
 
-- `.gitignore`: `backend/models/` 改为精确匹配 `*.pt`/`*.bin`/`*.onnx`（原来阻止了 ORM models 提交）
+1. **`.gitignore`**: `backend/models/` 改为精确匹配 `*.pt`/`*.bin`/`*.onnx`（原来阻止了 ORM models 提交）
+
+2. **Pydantic `QuestionOut.id` 类型错误**: `id: UUID` → `id: str`
+   - 根因：`Question.id` 是语义字符串（`"agent_001"`），不是 UUID
+   - 影响：`QuestionOut.model_validate(question)` 抛 `uuid_parsing` 校验错误
+
+3. **Pydantic `answer_key_points` / `followup_tree` 为 None 时校验失败**
+   - 根因：SQLAlchemy 在 flush 前不会应用 `default=[]`，pydantic 收到 `None` → 报 `list_type` / `dict_type` 错误
+   - 修复：添加 `@field_validator(mode='before')`，None → `[]` / `{}`
+
+4. **Pydantic `model_config` 格式**: `{"from_attributes": True}` → `ConfigDict(from_attributes=True)`
+   - pydantic V2 推荐使用 `ConfigDict` 而非裸 dict
+
+5. **IDEA Python SDK 路径指向错误**
+   - IDEA 配置的 venv 路径：`Intervue/.venv/`（根目录，依赖未安装）
+   - 实际 venv 路径：`Intervue/backend/.venv/`（pip install -r requirements.txt 在此执行）
+   - 修复：`jdk.table.xml` 中两处路径改为 `backend/.venv/`
+
+6. **`requirements.txt` 依赖版本冲突**
+   - `langgraph==1.0.0` + `langchain-openai==0.3.0` → `langchain-core` 版本冲突（0.x vs 1.x）
+   - 根因：requirements.txt 固定了旧版本，新版 pip resolver 拒绝安装
+   - 实际运行环境已安装新版本（langgraph 1.2.4, langchain-openai 1.3.0）且兼容
+   - 临时方案：使用 `backend/.venv` 中已安装的版本；长期：更新 requirements.txt 解除固定版本
 
 ---
 
