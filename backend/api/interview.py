@@ -52,13 +52,18 @@ async def start_interview(
         "years_of_exp": profile.years_of_exp if profile else 0,
         "current_level": profile.current_level if profile else "mid",
     }
-    session_manager.create_session(
+    sid = session_manager.create_session(
         user_id=user.id,
         profile=profile_dict,
         round=data.round,
         style=data.style,
         session_id=str(interview.id),
     )
+    # Persist initial state to DB
+    try:
+        await session_manager.save_state(sid, db)
+    except Exception:
+        pass  # best-effort: session still works in memory
 
     return interview
 
@@ -118,29 +123,40 @@ async def get_next_question(
     profile = profile_result.scalar_one_or_none()
 
     # Use session manager (LangGraph-backed) to select next question
+    sid = str(interview_id)
     try:
-        next_q = session_manager.get_next_question(str(interview_id))
+        next_q = session_manager.get_next_question(sid)
     except ValueError:
-        # Session not found — create one on the fly
-        profile_dict = {
-            "tech_stack": profile.tech_stack if profile else [],
-            "years_of_exp": profile.years_of_exp if profile else 0,
-            "current_level": profile.current_level if profile else "mid",
-        }
-        session_manager.create_session(
-            user_id=user.id,
-            profile=profile_dict,
-            round=interview.round,
-            style=interview.style,
-            session_id=str(interview_id),
-        )
-        next_q = session_manager.get_next_question(str(interview_id))
+        # Session not found — try DB restore, then recreate
+        restored = await session_manager.restore_from_db(sid, db)
+        if restored:
+            next_q = session_manager.get_next_question(sid)
+        else:
+            profile_dict = {
+                "tech_stack": profile.tech_stack if profile else [],
+                "years_of_exp": profile.years_of_exp if profile else 0,
+                "current_level": profile.current_level if profile else "mid",
+            }
+            session_manager.create_session(
+                user_id=user.id,
+                profile=profile_dict,
+                round=interview.round,
+                style=interview.style,
+                session_id=sid,
+            )
+            next_q = session_manager.get_next_question(sid)
 
     if not next_q:
         # Mark interview as complete
         interview.status = "completed"
         await db.commit()
         raise HTTPException(status_code=404, detail="No more questions available")
+
+    # Persist state after question selection
+    try:
+        await session_manager.save_state(sid, db)
+    except Exception:
+        pass
 
     question_text = next_q["question_text"]
 
@@ -191,61 +207,71 @@ async def submit_answer(
 
     # Process answer through session manager (LangGraph-backed)
     try:
-        result = await session_manager.process_answer(interview_id, data.user_answer)
+        processed = await session_manager.process_answer(interview_id, data.user_answer)
     except ValueError:
-        # Session not found — fall back to direct agent calls
-        from services.seed_service import get_question_by_id
-        question_data = get_question_by_id(str(record.question_id)) if record.question_id else None
-        if not question_data:
-            question_data = {
-                "id": str(record.question_id) if record.question_id else "seed_fallback",
-                "question_text": record.question_text,
-                "topic": "",
-                "sub_topic": "",
-                "answer_key_points": [],
-                "followup_tree": {},
+        # Session not found — try DB restore, then fall back to direct agent calls
+        restored = await session_manager.restore_from_db(interview_id, db)
+        if restored:
+            processed = await session_manager.process_answer(interview_id, data.user_answer)
+        else:
+            from services.seed_service import get_question_by_id
+            question_data = get_question_by_id(str(record.question_id)) if record.question_id else None
+            if not question_data:
+                question_data = {
+                    "id": str(record.question_id) if record.question_id else "seed_fallback",
+                    "question_text": record.question_text,
+                    "topic": "",
+                    "sub_topic": "",
+                    "answer_key_points": [],
+                    "followup_tree": {},
+                }
+
+            followup_result = await followup_engine.determine_action(
+                question=question_data,
+                user_answer=data.user_answer,
+                current_depth=0,
+                followup_count=0,
+                max_depth=4,
+            )
+
+            evaluation = await evaluate_agent.evaluate_answer(
+                question_text=record.question_text,
+                answer_key_points=question_data.get("answer_key_points", []),
+                user_answer=data.user_answer,
+                topic=question_data.get("topic", ""),
+                sub_topic=question_data.get("sub_topic", ""),
+            )
+
+            processed = {
+                "score": evaluation.get("score", 3),
+                "feedback": evaluation.get("feedback", ""),
+                "blind_spots": evaluation.get("blind_spots", []),
+                "action": followup_result.get("action", "next_question"),
+                "followup_text": followup_result.get("followup_text", ""),
+                "has_followup": followup_result.get("action") in ("followup", "probe", "give_hint", "degrade"),
             }
 
-        followup_result = await followup_engine.determine_action(
-            question=question_data,
-            user_answer=data.user_answer,
-            current_depth=0,
-            followup_count=0,
-            max_depth=4,
-        )
-
-        evaluation = await evaluate_agent.evaluate_answer(
-            question_text=record.question_text,
-            answer_key_points=question_data.get("answer_key_points", []),
-            user_answer=data.user_answer,
-            topic=question_data.get("topic", ""),
-            sub_topic=question_data.get("sub_topic", ""),
-        )
-
-        result = {
-            "score": evaluation.get("score", 3),
-            "feedback": evaluation.get("feedback", ""),
-            "blind_spots": evaluation.get("blind_spots", []),
-            "action": followup_result.get("action", "next_question"),
-            "followup_text": followup_result.get("followup_text", ""),
-            "has_followup": followup_result.get("action") in ("followup", "probe", "give_hint", "degrade"),
-        }
+    # Persist session state after answer processing
+    try:
+        await session_manager.save_state(interview_id, db)
+    except Exception:
+        pass
 
     # Update record with evaluation
-    record.score = result.get("score", 3)
-    record.blind_spots = result.get("blind_spots", [])
+    record.score = processed.get("score", 3)
+    record.blind_spots = processed.get("blind_spots", [])
 
     await db.commit()
 
     return {
         "status": "ok",
         "record_id": str(record_id),
-        "score": result.get("score", 3),
-        "feedback": result.get("feedback", ""),
-        "blind_spots": result.get("blind_spots", []),
-        "action": result.get("action", "next_question"),
-        "followup_text": result.get("followup_text", ""),
-        "has_followup": result.get("has_followup", False),
+        "score": processed.get("score", 3),
+        "feedback": processed.get("feedback", ""),
+        "blind_spots": processed.get("blind_spots", []),
+        "action": processed.get("action", "next_question"),
+        "followup_text": processed.get("followup_text", ""),
+        "has_followup": processed.get("has_followup", False),
     }
 
 

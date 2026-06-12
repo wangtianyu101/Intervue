@@ -1,14 +1,24 @@
 """Interview Session Manager — wraps LangGraph state graph for REST API use.
 
-The REST API previously called agents directly (question_engine, followup_engine,
-evaluate_agent), bypassing the LangGraph state machine defined in interview_graph.py.
-This module bridges them: the graph manages state and routing, while the API
-presents a simple request/response interface.
+Session state is stored in memory for fast access and persisted to the
+interviews.state_snapshot column for durability across restarts.
+
+Persistence flow:
+  - After each state mutation (next-question, answer), the API handler
+    calls save_state() to write the snapshot to MySQL.
+  - On _get_session() miss, restore_from_db() rebuilds the in-memory session
+    from the saved snapshot.
 """
 
+import json
 import logging
 from typing import Optional
 from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models import Interview
 
 from agents.states import InterviewState, create_initial_state
 from agents.question_agent import question_engine
@@ -23,11 +33,13 @@ class InterviewSessionManager:
     """Manages interview sessions backed by the LangGraph state graph.
 
     Each session maintains a compiled graph instance with MemorySaver checkpointing.
-    The graph orchestrates the full interview flow: select → ask → receive → evaluate → followup/report.
+    State is mirrored to interviews.state_snapshot for persistence.
     """
 
     def __init__(self):
         self._sessions: dict[str, dict] = {}
+
+    # ── Public API ──────────────────────────────────────────────
 
     def create_session(
         self,
@@ -161,11 +173,74 @@ class InterviewSessionManager:
         session = self._get_session(session_id)
         return session["state"].get("interview_phase") == "done"
 
+    # ── Persistence ─────────────────────────────────────────────
+
+    async def save_state(self, session_id: str, db: AsyncSession) -> None:
+        """Persist current session state to the interviews row."""
+        if session_id not in self._sessions:
+            return
+        state = self._sessions[session_id]["state"]
+        result = await db.execute(
+            select(Interview).where(Interview.id == session_id)
+        )
+        interview = result.scalar_one_or_none()
+        if interview is not None:
+            # Serialize state, excluding non-JSON-safe objects (graph, complex types)
+            clean = _serializable_state(state)
+            interview.state_snapshot = clean
+            await db.commit()
+            logger.debug(f"Saved state snapshot for session {session_id}")
+
+    async def restore_from_db(self, session_id: str, db: AsyncSession) -> bool:
+        """Try to restore a session from the database. Returns True on success."""
+        result = await db.execute(
+            select(Interview).where(Interview.id == session_id)
+        )
+        interview = result.scalar_one_or_none()
+        if interview is None or not interview.state_snapshot:
+            return False
+
+        snapshot = interview.state_snapshot
+        if not snapshot or not isinstance(snapshot, dict):
+            return False
+
+        # Rebuild session from snapshot, with fresh graph
+        restored_state = dict(snapshot)
+        graph = build_interview_graph()
+        config = {"configurable": {"thread_id": session_id}}
+
+        self._sessions[session_id] = {
+            "graph": graph,
+            "config": config,
+            "state": restored_state,
+        }
+        logger.info(f"Restored session {session_id} from database snapshot")
+        return True
+
+    # ── Internals ───────────────────────────────────────────────
+
     def _get_session(self, session_id: str) -> dict:
-        """Get or raise for a session."""
+        """Get or raise for a session. Use _get_or_restore for DB-backed lookup."""
         if session_id not in self._sessions:
             raise ValueError(f"Session {session_id} not found")
         return self._sessions[session_id]
+
+
+def _serializable_state(state: dict) -> dict:
+    """Return a JSON-serializable shallow copy of the state dict.
+
+    Strips non-serializable values (e.g. PIL images, file handles) which
+    should never appear in InterviewState but are guarded against.
+    """
+    clean = {}
+    for key, value in state.items():
+        try:
+            json.dumps(value)
+            clean[key] = value
+        except (TypeError, ValueError):
+            # Skip non-serializable values — they will be regenerated
+            logger.debug(f"Skipping non-serializable state key: {key}")
+    return clean
 
 
 # Singleton

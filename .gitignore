@@ -14,8 +14,10 @@ dist/
 node_modules/
 .next/
 
-# Models (downloaded at runtime)
-backend/models/
+# Models (ML weights downloaded at runtime)
+backend/models/*.pt
+backend/models/*.bin
+backend/models/*.onnx
 
 # Uploads
 uploads/
