@@ -57,7 +57,17 @@ async def update_profile(
     return profile
 
 
+@router.post("/resume")
+async def upload_resume(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload resume PDF → extract text → LLM fills tech_stack/years/level."""
+    from fastapi import UploadFile, File
+    # This endpoint expects multipart form data
+    return {"message": "Resume upload — requires multipart form. Use PUT /api/profile/me with resume_text for now."}
+
+
 def _extract_resume_summary(resume_text: str) -> str:
     """Stub — will use LLM extraction in Week 2"""
-    # Keep first 2000 chars as raw summary until we wire LLM
     return resume_text[:2000]

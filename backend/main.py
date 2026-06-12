@@ -7,6 +7,8 @@ from api.auth import router as auth_router
 from api.profile import router as profile_router
 from api.interview import router as interview_router
 from api.report import router as report_router
+from api.dashboard import router as dashboard_router
+from api.analytics import router as analytics_router
 
 logger = logging.getLogger("codemock")
 
@@ -24,6 +26,8 @@ app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(interview_router)
 app.include_router(report_router)
+app.include_router(dashboard_router)
+app.include_router(analytics_router)
 
 
 @app.on_event("startup")

@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
@@ -20,6 +20,44 @@ from services.interview_service import session_manager
 logger = logging.getLogger("codemock")
 
 router = APIRouter(prefix="/api/interviews", tags=["interviews"])
+
+
+@router.get("")
+async def list_interviews(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    status: str = "",
+    topic: str = "",
+    page: int = 1,
+    size: int = 20,
+):
+    """List user's interviews with optional filters and pagination."""
+    query = select(Interview).where(Interview.user_id == user.id)
+    if status:
+        query = query.where(Interview.status == status)
+    query = query.order_by(Interview.started_at.desc()).offset((page - 1) * size).limit(size)
+
+    result = await db.execute(query)
+    interviews = result.scalars().all()
+
+    # Count total
+    count_q = select(func.count()).select_from(Interview).where(Interview.user_id == user.id)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    items = []
+    for iv in interviews:
+        items.append({
+            "id": iv.id,
+            "round": iv.round,
+            "style": iv.style,
+            "status": iv.status,
+            "total_questions": iv.total_questions,
+            "overall_score": iv.overall_score,
+            "started_at": iv.started_at.isoformat() if iv.started_at else None,
+            "ended_at": iv.ended_at.isoformat() if iv.ended_at else None,
+        })
+
+    return {"items": items, "total": total, "page": page, "size": size}
 
 
 @router.post("", response_model=InterviewOut)
