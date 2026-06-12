@@ -821,7 +821,60 @@ Week 4: 报告 + 打磨 + 发布
 
 ---
 
-## 九、下一步确认
+## 九、P0 实现状态（2026-06-12 完成）
+
+### 9.1 ORM Models
+
+`backend/models/__init__.py` — 6 个 SQLAlchemy 2.0 模型，所有 PK 为 String(36)（UUID-as-string）：
+
+```python
+# 实体关系
+User ──< Profile ──< Interview ──< QuestionRecord
+  │                    │
+  └──< Report ─────────┘
+```
+
+| 模型 | 表名 | 关键字段 |
+|---|---|---|
+| `User` | users | id, github_id(unique), github_username, avatar_url, email, last_login_at, created_at |
+| `Profile` | profiles | id, user_id(FK), tech_stack(JSON), years_of_exp, current_level, target_companies(JSON), resume_summary, skill_map(JSON) |
+| `Interview` | interviews | id, user_id(FK), profile_id(FK), round, style, status, **state_snapshot(JSON)**, total_questions, overall_score |
+| `QuestionRecord` | question_records | id, interview_id(FK), question_id(nullable), question_text, user_answer, followup_chain(JSON), score, blind_spots(JSON), time_spent |
+| `Question` | questions | id(语义ID, PK), topic, sub_topic, difficulty, round, question_text, answer_key_points(JSON), followup_tree(JSON) |
+| `Report` | reports | id, interview_id(FK), user_id(FK), radar_data(JSON), top_blind_spots(JSON), improvement_plan(JSON) |
+
+设计决策：
+- JSON 列用 `sqlalchemy.JSON`，MySQL 8.4 原生支持
+- 枚举值（round、status、style）用 String 列，不用 MySQL ENUM
+- `Question.id` 用语义 ID（如 `"agent_001"`），种子数据提供预定义 ID
+- 去掉了 PostgreSQL JSONB 依赖，全程 MySQL 8.4
+
+### 9.2 Session 持久化
+
+`InterviewSessionManager` 新增两个方法：
+
+- `save_state(session_id, db)` — 将当前 InterviewState 序列化写入 `interviews.state_snapshot`
+- `restore_from_db(session_id, db)` — 从 DB 快照恢复内存 session
+
+API 路由的持久化调用点：
+| 端点 | 持久化时机 |
+|---|---|
+| `POST /api/interviews` | 创建 session 后立即 save |
+| `POST /{id}/next-question` | 选题后 save；若 session 丢失，先 restore_from_db |
+| `POST /records/{id}/answer` | 评估后 save；若 session 丢失，先 restore_from_db → 失败则 fallback 到直接 agent 调用 |
+
+关键设计：
+- **JSON snapshot 方式**（不用 LangGraph SqliteSaver）— 当前代码绕过 graph 直接操作 state dict
+- **非 JSON 安全值自动过滤**（`_serializable_state()`）
+- **Best-effort 语义** — save 失败不影响面试继续
+
+### 9.3 修复项
+
+- `.gitignore`: `backend/models/` 改为精确匹配 `*.pt`/`*.bin`/`*.onnx`（原来阻止了 ORM models 提交）
+
+---
+
+## 十、下一步确认
 
 1. AI Agent 技能图谱覆盖（Agent 核心 40% / RAG 30% / LangGraph 20% / Java 10%）→ 这个权重合理吗？
 2. LiveKit + Deepgram 实时流方案 → 外部服务依赖可以接受吗？
