@@ -23,9 +23,18 @@ export default function Dashboard() {
   const recs = dashData?.recommendations || [];
   const displayName = profile?.display_name || profile?.github_username || "用户";
 
+  const recItems = recs.length > 0
+    ? recs.map((r: any, i: number) => ({ key: `r${i}`, n: `${i+1}`, t: r.title, d: r.detail }))
+    : [
+        { key: "d1", n: "1", t: "完善个人信息", d: "上传简历，AI 自动提取技能标签" },
+        { key: "d2", n: "2", t: "开始首次面试", d: "选择 AI Agent 方向，体验追问引擎" },
+        { key: "d3", n: "3", t: "浏览知识库", d: "Obsidian 集成 · 49 篇笔记可搜索" },
+      ];
+
+  const fmtNum = (v: any) => v >= 10000 ? ((v/1000).toFixed(0)+'K') : (v ?? '-');
+
   return (
     <div className="min-h-screen bg-[#050914] text-[#f1f5f9]">
-      {/* Top Nav */}
       <nav className="sticky top-0 z-50 flex items-center justify-between px-6 py-3.5 bg-[#0c1024]/90 backdrop-blur-xl border-b border-indigo-500/10">
         <div className="flex items-center gap-3">
           <span className="text-lg font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">DevBrain</span>
@@ -55,12 +64,11 @@ export default function Dashboard() {
           <p className="text-gray-400 text-sm mt-1">中级工程师 · 3年经验</p>
         </div>
 
-        {/* 3 Module Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mb-10">
           {[
             { icon: M_Interview, title: "面试练习", desc: "AI 追问引擎 · 实时语音对话\n50+ 题库 · 能力雷达图", badge: `${iv.total || 0}次 · 得分 ${iv.latest_score || "-"}`, badgeColor: "bg-indigo-500/10 text-indigo-300 border-indigo-500/20", href: "/interview/profile" },
             { icon: M_Knowledge, title: "知识管理", desc: "Obsidian 集成 · 全文检索\n知识图谱 · 智能关联", badge: `${kn.total_notes || 0} 篇笔记`, badgeColor: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20", href: "/knowledge" },
-            { icon: M_News, title: "信息推送", desc: "AI 日报 · 周报深度分析\n代码统计 · 信源管理", badge: `${(st.total_tokens || 0) >= 1000 ? ((st.total_tokens || 0) / 1000).toFixed(0) + 'K' : st.total_tokens || 0} tokens`, badgeColor: "bg-amber-500/10 text-amber-400 border-amber-500/20", href: "/news" },
+            { icon: M_News, title: "信息推送", desc: "AI 日报 · 周报深度分析\n代码统计 · 信源管理", badge: `${fmtNum(st.total_tokens)} tokens`, badgeColor: "bg-amber-500/10 text-amber-400 border-amber-500/20", href: "/news" },
           ].map(card => (
             <div key={card.title} onClick={() => router.push(card.href)}
               className="group relative bg-white/[0.03] backdrop-blur-xl border border-indigo-500/10 rounded-2xl p-7 cursor-pointer hover:border-indigo-500/30 hover:-translate-y-1 transition-all duration-300 overflow-hidden"
@@ -76,16 +84,15 @@ export default function Dashboard() {
           ))}
         </div>
 
-        {/* Overview + AI Recommendations */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           <div className="bg-white/[0.03] backdrop-blur-xl border border-indigo-500/10 rounded-2xl p-7">
             <h3 className="text-base font-semibold mb-5">本周概览</h3>
             <div className="grid grid-cols-2 gap-4">
               {[
                 { v: iv.latest_score || "-", l: "面试得分", c: "text-indigo-400", bg: "bg-indigo-500/5" },
-                { v: "38", l: "知识笔记", c: "text-emerald-400", bg: "bg-emerald-500/5" },
-                { v: "-", l: "Token 消耗", c: "text-amber-400", bg: "bg-amber-500/5" },
-                { v: "-", l: "代码变更行", c: "text-indigo-400", bg: "bg-indigo-500/5" },
+                { v: kn.total_notes || 0, l: "知识笔记", c: "text-emerald-400", bg: "bg-emerald-500/5" },
+                { v: fmtNum(st.total_tokens), l: "Token 消耗", c: "text-amber-400", bg: "bg-amber-500/5" },
+                { v: fmtNum(st.total_code), l: "代码变更行", c: "text-indigo-400", bg: "bg-indigo-500/5" },
               ].map(s => (
                 <div key={s.l} className={`${s.bg} rounded-xl p-4 text-center`}>
                   <div className={`text-2xl font-bold font-mono ${s.c}`}>{s.v}</div>
@@ -97,21 +104,12 @@ export default function Dashboard() {
           <div className="bg-white/[0.03] backdrop-blur-xl border border-indigo-500/10 rounded-2xl p-7">
             <h3 className="text-base font-semibold mb-5">AI 智能推荐</h3>
             <div className="space-y-3">
-              {recs.length > 0 ? recs.map((r: any, i: number) => (
-                <div key={i} className="flex gap-3 p-3.5 bg-indigo-500/[0.03] rounded-xl border-l-3 border-indigo-500">
-                  <span className="font-mono font-bold text-indigo-400 text-sm">{i + 1}</span>
-                  <div><div className="text-sm font-medium">{r.title}</div><div className="text-xs text-gray-500 mt-0.5">{r.detail}</div></div>
-                </div>
-              )) : [
-                { n: "1", t: "完善个人信息", d: "上传简历，AI 自动提取技能标签" },
-                { n: "2", t: "开始首次面试", d: "选择 AI Agent 方向，体验追问引擎" },
-                { n: "3", t: "浏览知识库", d: "Obsidian 集成 · 47 篇笔记可搜索" },
-              ].map(r => (
-                <div key={r.n} className="flex gap-3 p-3.5 bg-indigo-500/[0.03] rounded-xl border-l-3 border-indigo-500">
+              {recItems.map(r => (
+                <div key={r.key} className="flex gap-3 p-3.5 bg-indigo-500/[0.03] rounded-xl border-l-3 border-indigo-500">
                   <span className="font-mono font-bold text-indigo-400 text-sm">{r.n}</span>
                   <div><div className="text-sm font-medium">{r.t}</div><div className="text-xs text-gray-500 mt-0.5">{r.d}</div></div>
                 </div>
-              )}
+              ))}
             </div>
           </div>
         </div>
@@ -120,7 +118,6 @@ export default function Dashboard() {
   );
 }
 
-// SVG path data for cards
 const M_Interview = <><rect x="6" y="8" width="32" height="28" rx="4" /><path d="M14 18h16M14 24h12M14 30h14" strokeLinecap="round" /><circle cx="36" cy="26" r="5" fill="currentColor" opacity="0.3" /></>;
 const M_Knowledge = <><path d="M8 6h18l10 10v22a2 2 0 01-2 2H8a2 2 0 01-2-2V8a2 2 0 012-2z" /><path d="M26 6v10h10M14 20h16M14 26h10M14 32h14" strokeLinecap="round" /></>;
 const M_News = <><path d="M8 8h28a4 4 0 014 4v18a4 4 0 01-4 4H8a4 4 0 01-4-4V12a4 4 0 014-4z" /><path d="M4 16h36M14 22l4 4 6-6 8 8" strokeLinecap="round" strokeLinejoin="round" /></>;
