@@ -896,6 +896,22 @@ API 路由的持久化调用点：
 
 ---
 
+### 9.4 Voice Pipeline 踩坑记录
+
+**问题**：前端连接 LiveKit 正常，但面试官不说话、用户语音无反应。
+
+**根因**：LiveKit Agent Worker (`voice/livekit_worker.py`) 依赖 `livekit-agents` 和 `livekit-plugins-silero`，它们不在 `pip install livekit` 的依赖中。`livekit` PyPI 包 v1.x 是客户端 SDK，不是服务端 Agent SDK。Worker 启动失败时静默——LiveKit 房间照常建立，但无人处理 STT→Agent→TTS 管道。
+
+**解决**：
+```bash
+pip install livekit-agents livekit-plugins-silero
+python voice/livekit_worker.py  # 必须手动启动，不会随 FastAPI 自动启动
+```
+
+**教训**：`livekit-agents` 和 `livekit` 是两个不同的包。Worker 进程需要独立启动和监控。后续可以考虑用 `supervisord` 或 Docker 管理 Worker 生命周期。
+
+---
+
 ## 十、下一步确认
 
 1. AI Agent 技能图谱覆盖（Agent 核心 40% / RAG 30% / LangGraph 20% / Java 10%）→ 这个权重合理吗？
