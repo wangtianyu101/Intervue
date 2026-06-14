@@ -8,6 +8,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
+from core.config import settings
 from core.database import get_db
 from core.dependencies import get_current_user
 from models import User, Interview, Profile, QuestionRecord
@@ -20,6 +21,27 @@ from services.interview_service import session_manager
 logger = logging.getLogger("codemock")
 
 router = APIRouter(prefix="/api/interviews", tags=["interviews"])
+
+
+def _start_voice_worker(interview_id: str):
+    """Spawn voice worker process for the given interview room (fire-and-forget)."""
+    import subprocess, os
+    env = {
+        **os.environ,
+        "LIVEKIT_ROOM": f"interview-{interview_id}",
+        "LIVEKIT_URL": settings.livekit_url,
+        "LIVEKIT_API_KEY": settings.livekit_api_key,
+        "LIVEKIT_API_SECRET": settings.livekit_api_secret,
+        "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    }
+    import sys
+    logfile = open(f"/tmp/voice-worker-{interview_id[:8]}.log", "a")
+    subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voice", "interview_room.py")],
+        env=env,
+        stdout=logfile,
+        stderr=logfile,
+    )
 
 
 @router.get("")
@@ -102,6 +124,12 @@ async def start_interview(
         await session_manager.save_state(sid, db)
     except Exception:
         pass  # best-effort: session still works in memory
+
+    # Start voice worker for this room (fire-and-forget)
+    try:
+        _start_voice_worker(str(interview.id))
+    except Exception:
+        pass
 
     return interview
 

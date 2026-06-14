@@ -1,193 +1,59 @@
-"""LiveKit Agent Worker — V2: real-time phone-call interview.
+"""LiveKit Voice Agent — Local STT/TTS + DeepSeek LLM interviewer."""
 
-Audio flow:
-  User mic → LiveKit → Silero VAD → Streaming STT
-  → Agent logic → Persona wrap → Piper TTS → User speaker
-
-Uses livekit-agents v1.6+ Agent class (VoicePipelineAgent was removed).
-"""
-
-import asyncio
 import logging
-import re
-from typing import AsyncIterable, Optional
-
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
-from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.voice import Agent
-from livekit.plugins import silero
+from livekit.plugins import silero, openai
 
 from core.config import settings
-from agents.states import create_initial_state
-from agents.question_agent import question_engine
-from agents.followup_agent import followup_engine
-from voice.turn_manager import TurnManager
-from voice.persona import InterviewerPersona
 
 logger = logging.getLogger("codemock-voice")
 
+INTERVIEWER_PROMPT = """你是 Alex，一位专业友好的 AI 技术面试官。
 
-# ── STT ────────────────────────────────────────────────────
+面试规则：
+1. 先向候选人打招呼，请他们简单介绍自己的技术栈和经验
+2. 根据介绍选方向提问：AI Agent架构(ReAct/Tool Use/Memory/MCP)、RAG、LangGraph、Java后端
+3. 每次只问一个问题，候选人的回答会通过语音转文字传给你
+4. 根据回答质量：好→深入追问；一般→引导补充；不会→给提示或换方向
+5. 8题左右结束，给简短反馈
+6. 保持专业友好的语气，像真实面试对话
 
-class LocalSTT:
-    def __init__(self):
-        self._whisper_client = None
-        self._simple_stt = None
-
-    async def _ensure_whisper(self):
-        if self._whisper_client is not None: return
-        try:
-            from voice.stt import WhisperLiveClient
-            self._whisper_client = WhisperLiveClient()
-            await self._whisper_client.connect()
-            logger.info("WhisperLive connected")
-        except Exception as e:
-            logger.warning(f"WhisperLive unavailable: {e}")
-            self._whisper_client = None
-
-    async def recognize(self, *, audio: bytes) -> str:
-        if not audio or len(audio) < 160: return ""
-        if self._whisper_client:
-            try:
-                await self._whisper_client.send_audio(audio)
-                return await self._whisper_client.receive_transcript() or ""
-            except Exception: pass
-        if self._simple_stt is None:
-            from voice.stt import SimpleSTT
-            self._simple_stt = SimpleSTT()
-        try: return self._simple_stt.transcribe_bytes(audio) or ""
-        except Exception as e:
-            logger.warning(f"STT error: {e}")
-            return ""
-
-    async def aclose(self):
-        if self._whisper_client:
-            try: await self._whisper_client.close()
-            except Exception: pass
+现在开始——先打招呼，请候选人做自我介绍。"""
 
 
-# ── TTS ────────────────────────────────────────────────────
+async def entrypoint(ctx: JobContext):
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info(f"Voice room joined: {ctx.room.name}")
 
-class LocalTTS:
-    def __init__(self):
-        self._engine = None
+    agent = Agent(
+        instructions=INTERVIEWER_PROMPT,
+        vad=silero.VAD.load(),
+        stt=openai.STT(
+            model="whisper-1",
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        ),
+        llm=openai.LLM(
+            model="deepseek-chat",
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        ),
+        tts=openai.TTS(
+            model="tts-1",
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        ),
+    )
 
-    def _ensure(self):
-        if self._engine is not None: return
-        try:
-            from voice.tts import TTSEngine
-            self._engine = TTSEngine()
-            logger.info("Piper TTS loaded")
-        except Exception as e:
-            logger.warning(f"TTS unavailable: {e}")
-            self._engine = None
-
-    def synthesize(self, *, text: str) -> bytes:
-        self._ensure()
-        if self._engine is None: return b""
-        try: return self._engine.synthesize(text)
-        except Exception as e:
-            logger.warning(f"TTS error: {e}")
-            return b""
-
-
-# ═══════════════════════════════════════════════════════════
-# Interview Agent
-# ═══════════════════════════════════════════════════════════
-
-class InterviewAgentV2(Agent):
-    """V2: Full-duplex interview with turn management and persona."""
-
-    def __init__(self, ctx: JobContext):
-        super().__init__(
-            vad=silero.VAD.load(),
-            stt=LocalSTT(),
-            tts=LocalTTS(),
-        )
-        self.ctx = ctx
-        self.turn = TurnManager()
-        self.persona = InterviewerPersona(name="Alex")
-        self.state = None
-        self.profile = {
-            "tech_stack": ["LangChain", "LangGraph", "RAG"],
-            "years_of_exp": 3,
-            "current_level": "mid",
-        }
-        self._done = asyncio.Event()
-
-    async def on_enter(self):
-        await self.ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-        self.state = create_initial_state(
-            user_id="voice_user", profile=self.profile, round="round1",
-        )
-        greeting = self.persona.greeting(self.profile["tech_stack"])
-        self.turn.ai_started_speaking()
-        await self.say(greeting, allow_interruptions=True)
-        self.turn.ai_stopped_speaking()
-
-    async def on_user_message(self, text: str):
-        """Handle transcribed user speech."""
-        if not text.strip(): return
-
-        phase = self.state.get("interview_phase", "intro") if self.state else "intro"
-        response = await (self._handle_intro(text) if phase == "intro" else self._handle_answer(text))
-
-        self.turn.ai_started_speaking()
-        await self.say(response, allow_interruptions=True)
-        self.turn.ai_stopped_speaking()
-
-    async def _handle_intro(self, text: str) -> str:
-        keywords = ["langchain","langgraph","rag","python","go","java","react","vue","k8s","docker","agent","llm","spring"]
-        found = [t for t in keywords if t.lower() in text.lower()]
-        if found: self.profile["tech_stack"] = list(set(found))
-        next_q = question_engine.select_next_question(
-            round="round1", profile=self.profile, questions_asked=[], blind_spots=[])
-        if next_q:
-            self.state["current_question"] = next_q
-            self.state["current_question_id"] = next_q["id"]
-            self.state["interview_phase"] = "questioning"
-            return self.persona.wrap({"action":"next_question","question_text":next_q["question_text"]})
-        return "请简单说一下你对 Agent 架构的理解？"
-
-    async def _handle_answer(self, text: str) -> str:
-        self.state["user_answer"] = text
-        q = self.state.get("current_question", {})
-        result = await followup_engine.determine_action(
-            question=q, user_answer=text,
-            current_depth=self.state.get("current_depth",0),
-            followup_count=self.state.get("followup_count",0), max_depth=4)
-        action = result.get("action","next_question")
-
-        if action == "skip_and_record":
-            self.state["blind_spots"] = self.state.get("blind_spots",[]) + [result.get("blind_spot","")]
-            nq = question_engine.select_next_question(
-                round=self.state.get("round","round1"), profile=self.profile,
-                questions_asked=self.state.get("questions_asked",[]),
-                blind_spots=self.state.get("blind_spots",[]))
-            if nq:
-                self.state["current_question"] = nq; self.state["current_question_id"] = nq["id"]
-                self.state["current_depth"] = 0; self.state["followup_count"] = 0
-                return self.persona.wrap({"action":"next_question","question_text":nq["question_text"]})
-            self.state["interview_phase"] = "done"; return self.persona.closing()
-        elif action in ("followup","probe","give_hint","degrade"):
-            self.state["current_depth"] = self.state.get("current_depth",0) + 1
-            self.state["followup_count"] = self.state.get("followup_count",0) + 1
-            return self.persona.wrap({"action":"probe","followup_text":result.get("followup_text","能再详细说说吗？")})
-        else:
-            nq = question_engine.select_next_question(
-                round=self.state.get("round","round1"), profile=self.profile,
-                questions_asked=self.state.get("questions_asked",[]),
-                blind_spots=self.state.get("blind_spots",[]))
-            if nq:
-                self.state["current_question"] = nq; self.state["current_question_id"] = nq["id"]
-                self.state["current_depth"] = 0; self.state["followup_count"] = 0
-                return self.persona.wrap({"action":"next_question","question_text":nq["question_text"]})
-            self.state["interview_phase"] = "done"; return self.persona.closing()
-
-
-def entrypoint(ctx: JobContext):
-    agent = InterviewAgentV2(ctx)
     agent.start(ctx.room)
+    logger.info("Agent started — awaiting participant")
+
+    await ctx.wait_for_participant()
+    await agent.on_enter()
+    logger.info("Interview begun")
+
+    await ctx.done.wait()
 
 
 if __name__ == "__main__":
