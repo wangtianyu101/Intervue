@@ -323,7 +323,7 @@ export async function getDigestStats(): Promise<DigestStats> {
 // =====================================================================
 
 // === 学 tab：题目 ===
-export async function listQuestions(filters: QuestionListResponse extends never ? never : any = {}): Promise<QuestionListResponse> {
+export async function listQuestions(filters: Partial<QuestionListFilter> = {}): Promise<QuestionListResponse> {
   const params = new URLSearchParams();
   Object.entries(filters).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== "") params.append(k, String(v));
