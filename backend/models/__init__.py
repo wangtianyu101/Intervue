@@ -9,7 +9,7 @@ JSON columns use SQLAlchemy's JSON type, which maps to MySQL 8.4 JSON.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, Integer, Float, Text, DateTime, JSON, ForeignKey
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, JSON, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 
 from core.database import Base
@@ -76,6 +76,10 @@ class Interview(Base):
     overall_score = Column(Float, nullable=True)
     # P0-2: Session persistence — serialized InterviewState snapshot
     state_snapshot = Column(JSON, nullable=True)
+    # User actions: bookmark + soft delete. Nullable defaults so existing
+    # dev.db rows stay valid; new rows get the proper defaults.
+    is_favorite = Column(Boolean, default=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="interviews", foreign_keys=[user_id])
@@ -127,6 +131,8 @@ class Report(Base):
     radar_data = Column(JSON, default=dict)
     top_blind_spots = Column(JSON, default=list)
     improvement_plan = Column(JSON, default=list)
+    summary = Column(Text, nullable=True)
+    overall_score = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
     # Relationships

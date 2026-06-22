@@ -167,7 +167,12 @@ class ObsidianService:
         return {"total_notes": tn, "total_words": tw, "total_chars": tc, "by_folder": dict(sorted(groups.items()))}
 
     def get_backlinks(self, rel_path: str) -> list[dict]:
-        tn = os.path.splitext(os.path.basename(rel_path))[0].lower()
+        # Match either strict lowercase equality OR a whitespace-stripped
+        # comparison — wikilinks like [[ReAct 模式]] should still resolve to
+        # the file `ReAct模式.md`. Same fuzzy rule `_resolve_wikilink` uses
+        # to build the graph, so backlinks stay consistent with it.
+        target = os.path.splitext(os.path.basename(rel_path))[0].lower()
+        target_compact = target.replace(" ", "").replace("　", "")
         results = []
         for root, dirs, files in os.walk(self.vault):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -178,7 +183,8 @@ class ObsidianService:
                 try: content = fp.read_text(encoding="utf-8")
                 except Exception: continue
                 for link in WIKILINK_RE.findall(content):
-                    if link.lower() == tn:
+                    lk = link.lower()
+                    if lk == target or lk.replace(" ", "").replace("　", "") == target_compact:
                         results.append({"path": rel, "name": fn, "link_text": link}); break
         return results
 

@@ -11,6 +11,7 @@ from api.dashboard import router as dashboard_router
 from api.analytics import router as analytics_router
 from api.knowledge import router as knowledge_router
 from api.news import router as news_router
+from api.voice_ws import router as voice_ws_router
 
 logger = logging.getLogger("codemock")
 
@@ -32,6 +33,7 @@ app.include_router(dashboard_router)
 app.include_router(analytics_router)
 app.include_router(knowledge_router)
 app.include_router(news_router)
+app.include_router(voice_ws_router)
 
 
 @app.on_event("startup")
