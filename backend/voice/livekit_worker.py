@@ -3,7 +3,8 @@
 import logging
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 from livekit.agents.voice import Agent
-from livekit.plugins import silero, openai
+from livekit.plugins.silero import VAD
+from livekit.plugins import openai as openai_plugin
 
 from core.config import settings
 
@@ -28,18 +29,18 @@ async def entrypoint(ctx: JobContext):
 
     agent = Agent(
         instructions=INTERVIEWER_PROMPT,
-        vad=silero.VAD.load(),
-        stt=openai.STT(
+        vad=VAD.load(),
+        stt=openai_plugin.STT(
             model="whisper-1",
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
         ),
-        llm=openai.LLM(
-            model="deepseek-chat",
+        llm=openai_plugin.LLM(
+            model=settings.llm_model,
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
         ),
-        tts=openai.TTS(
+        tts=openai_plugin.TTS(
             model="tts-1",
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,

@@ -28,6 +28,7 @@ from agents.states import create_initial_state
 from agents.question_agent import question_engine
 from agents.followup_agent import followup_engine
 from voice.persona import InterviewerPersona
+from voice.stt import SimpleSTT
 
 # ══════════════════════════════════════════════════════════
 #  Logging system — trace every pipeline step
@@ -126,8 +127,8 @@ async def run_worker():
     PIPELINE_LOG.info("LiveKit token generated")
 
     # ── STT: macOS native speech recognition (offline, no download) ──
-    stt = _MacOSSTT()
-    STT_LOG.info("STT engine initialized (macOS Speech framework)")
+    stt = SimpleSTT()
+    STT_LOG.info("STT engine initialized (faster-whisper)")
 
     # ── TTS (reuse existing TTSEngine) ──
     from voice.tts import TTSEngine
@@ -217,27 +218,58 @@ async def run_worker():
 
             # ═══ STEP 4: Publish audio back ═══
             speaking.set()
-            if audio_source is None:
-                audio_source = rtc.AudioSource(22050, 1)
-                await room.local_participant.publish_audio(audio_source)
-                AUDIO_LOG.info("Audio source published")
+            try:
+                if audio_source is None:
+                    audio_source = rtc.AudioSource(22050, 1)
+                    audio_track = rtc.LocalAudioTrack.create_audio_track("response", audio_source)
+                    await room.local_participant.publish_track(audio_track)
+                    AUDIO_LOG.info("Audio track published")
+                    await asyncio.sleep(0.5)  # Wait for track to be ready
 
-            frame = rtc.AudioFrame(
-                data=audio_bytes,
-                sample_rate=22050,
-                num_channels=1,
-                samples_per_channel=len(audio_bytes) // 2,
-            )
-            await audio_source.capture_frame(frame)
-            AUDIO_LOG.info(f"Audio frame sent ({len(audio_bytes)} bytes)")
+                frame = rtc.AudioFrame(
+                    data=audio_bytes,
+                    sample_rate=22050,
+                    num_channels=1,
+                    samples_per_channel=len(audio_bytes) // 2,
+                )
+                await audio_source.capture_frame(frame)
+                AUDIO_LOG.info(f"Audio frame sent ({len(audio_bytes)} bytes)")
 
-            await asyncio.sleep(0.5)
-            speaking.clear()
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                AUDIO_LOG.error(f"Audio publish failed: {e}")
+            finally:
+                speaking.clear()
 
     # ── Connect ──
     try:
         await room.connect(settings.livekit_url, token)
         PIPELINE_LOG.info(f"Connected to LiveKit room: {room_name}")
+
+        # Send initial greeting after connecting
+        greeting = persona.wrap({"action": "next_question", "question_text": "你好！我是 Alex，一位 AI 技术面试官。请先简单介绍一下你自己，包括你熟悉的编程语言和技术栈。"})
+        PIPELINE_LOG.info(f"Initial greeting: '{greeting[:60]}'")
+
+        # TTS for greeting
+        audio_bytes = tts_engine.synthesize(greeting)
+        if audio_bytes:
+            speaking.set()
+            try:
+                if audio_source is None:
+                    audio_source = rtc.AudioSource(22050, 1)
+                    audio_track = rtc.LocalAudioTrack.create_audio_track("greeting", audio_source)
+                    await room.local_participant.publish_track(audio_track)
+                    # Wait for track to be fully published
+                    await asyncio.sleep(2.0)
+                frame = rtc.AudioFrame(data=audio_bytes, sample_rate=22050, num_channels=1, samples_per_channel=len(audio_bytes) // 2)
+                await audio_source.capture_frame(frame)
+                TTS_LOG.info(f"Greeting sent ({len(audio_bytes)} bytes)")
+                await asyncio.sleep(len(audio_bytes) / 22050 + 0.5)  # Wait for audio to finish
+            except Exception as e:
+                TTS_LOG.error(f"Greeting failed: {e}")
+            finally:
+                speaking.clear()
+
         await asyncio.Event().wait()
     except Exception as e:
         PIPELINE_LOG.error(f"Fatal: {e}", exc_info=True)

@@ -2,6 +2,6 @@ port: 7880
 rtc:
   tcp_port: 7881
   udp_port: 7882
-  node_ip: 127.0.0.1
+  node_ip: 192.168.1.20
 keys:
   APIpPWHXXmwkUCq: tyRt2aPvDC0snGohanYNcxvJa4NonLybKiRykgl7ofA

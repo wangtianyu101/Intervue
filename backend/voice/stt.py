@@ -42,16 +42,11 @@ class SimpleSTT:
     def _load_model(self):
         if self._model is not None:
             return
-        from faster_whisper import WhisperModel
+        import whisper
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Loading faster-whisper model '{MODEL_SIZE}'...")
-        self._model = WhisperModel(
-            MODEL_SIZE,
-            device="cpu",
-            compute_type="int8",
-            download_root=str(MODEL_DIR),
-        )
-        logger.info("faster-whisper model ready")
+        logger.info(f"Loading whisper model '{MODEL_SIZE}' (openai-whisper)...")
+        self._model = whisper.load_model(MODEL_SIZE)
+        logger.info("whisper model ready")
 
     def transcribe_file(self, audio_path: str, language: str = "zh") -> str:
         """Transcribe an audio file. Supports any format ffmpeg can read (webm, wav, mp4, etc)."""
@@ -70,15 +65,16 @@ class SimpleSTT:
                 ], capture_output=True, timeout=30)
                 audio_path = wav_path
 
-            segments, info = self._model.transcribe(
+            result = self._model.transcribe(
                 audio_path,
                 language=language,
                 beam_size=5,
-                vad_filter=True,
             )
-            text = "".join(s.text for s in segments)
-            logger.info(f"STT result ({info.language}): {text[:80]}...")
-            return text.strip()
+            # openai-whisper returns dict with 'text' key
+            text = result.get("text", "").strip()
+            if text:
+                logger.info(f"STT result: {text[:80]}...")
+            return text
         except Exception as e:
             logger.error(f"STT transcribe failed: {e}")
             return ""

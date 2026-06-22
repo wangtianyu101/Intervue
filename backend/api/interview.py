@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import logging
 
@@ -23,10 +24,16 @@ logger = logging.getLogger("codemock")
 
 router = APIRouter(prefix="/api/interviews", tags=["interviews"])
 
+# Tracks LiveKit voice worker processes by interview_id. Populated by
+# _start_voice_worker (called when a client uses the LiveKit path), drained by
+# _stop_voice_worker (called from /complete). The WebSocket path doesn't spawn
+# workers, so the dict stays empty for WS-only users.
+_livekit_workers: dict[str, "subprocess.Popen"] = {}
+
 
 def _start_voice_worker(interview_id: str):
     """Spawn voice worker process for the given interview room (fire-and-forget)."""
-    import subprocess, os
+    import sys
     env = {
         **os.environ,
         "LIVEKIT_ROOM": f"interview-{interview_id}",
@@ -35,13 +42,67 @@ def _start_voice_worker(interview_id: str):
         "LIVEKIT_API_SECRET": settings.livekit_api_secret,
         "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     }
-    import sys
     logfile = open(f"/tmp/voice-worker-{interview_id[:8]}.log", "a")
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voice", "interview_room.py")],
         env=env,
         stdout=logfile,
         stderr=logfile,
+    )
+    _livekit_workers[interview_id] = proc
+
+
+def _stop_voice_worker(interview_id: str) -> bool:
+    """Kill the LiveKit worker for an interview, if one is running.
+
+    Returns True if a process was found and signaled, False otherwise.
+    Idempotent — safe to call multiple times.
+    """
+    proc = _livekit_workers.pop(interview_id, None)
+    if proc is None:
+        return False
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+    except Exception as e:
+        logger.warning(f"kill voice worker {interview_id} failed: {e}")
+    return True
+
+
+def _search_clause(q: str):
+    """Build a SQLAlchemy WHERE expression for the search filter.
+
+    Matches if ANY of:
+      - any QuestionRecord.question_text LIKE %q%
+      - any QuestionRecord.user_answer LIKE %q%
+      - Interview.round LIKE %q%
+      - Interview.style LIKE %q%
+
+    `%` and `_` in `q` are escaped so users can search for literal
+    patterns. Empty `q` returns None (caller should skip the filter).
+    """
+    from sqlalchemy import literal
+    if not q:
+        return None
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
+    record_match_subq = (
+        select(QuestionRecord.interview_id)
+        .where(QuestionRecord.question_text.like(literal(like), escape="\\"))
+        .union(
+            select(QuestionRecord.interview_id).where(
+                QuestionRecord.user_answer.like(literal(like), escape="\\"),
+            )
+        )
+    )
+    return (
+        Interview.id.in_(record_match_subq)
+        | Interview.round.like(literal(like), escape="\\")
+        | Interview.style.like(literal(like), escape="\\")
     )
 
 
@@ -51,20 +112,40 @@ async def list_interviews(
     db: AsyncSession = Depends(get_db),
     status: str = "",
     topic: str = "",
+    favorites: bool = False,
+    q: str = "",
     page: int = 1,
     size: int = 20,
 ):
-    """List user's interviews with optional filters and pagination."""
-    query = select(Interview).where(Interview.user_id == user.id)
+    """List user's interviews with optional filters and pagination.
+
+    `favorites=true` returns only bookmarked interviews (independent of
+    status). Soft-deleted interviews (deleted_at IS NOT NULL) are always
+    excluded. `q` does a case-insensitive LIKE across question text, user
+    answers, round, and style. Empty `q` skips the search filter entirely.
+    """
+    base = [
+        Interview.user_id == user.id,
+        Interview.deleted_at.is_(None),
+    ]
+
+    query = select(Interview).where(*base)
+    count_q = select(func.count()).select_from(Interview).where(*base)
     if status:
         query = query.where(Interview.status == status)
+        count_q = count_q.where(Interview.status == status)
+    if favorites:
+        query = query.where(Interview.is_favorite.is_(True))
+        count_q = count_q.where(Interview.is_favorite.is_(True))
+    search = _search_clause(q)
+    if search is not None:
+        query = query.where(search)
+        count_q = count_q.where(search)
+
     query = query.order_by(Interview.started_at.desc()).offset((page - 1) * size).limit(size)
 
     result = await db.execute(query)
     interviews = result.scalars().all()
-
-    # Count total
-    count_q = select(func.count()).select_from(Interview).where(Interview.user_id == user.id)
     total = (await db.execute(count_q)).scalar() or 0
 
     items = []
@@ -76,11 +157,85 @@ async def list_interviews(
             "status": iv.status,
             "total_questions": iv.total_questions,
             "overall_score": iv.overall_score,
+            "is_favorite": iv.is_favorite,
             "started_at": iv.started_at.isoformat() if iv.started_at else None,
             "ended_at": iv.ended_at.isoformat() if iv.ended_at else None,
         })
 
     return {"items": items, "total": total, "page": page, "size": size}
+
+
+@router.post("/{interview_id}/favorite")
+async def toggle_favorite(
+    interview_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle the is_favorite flag. Returns the new value.
+
+    Note: this endpoint does NOT filter deleted_at in the WHERE clause,
+    because the soft-delete state carries its own semantic — 410 Gone —
+    distinct from 404. Other action endpoints (next-question, complete,
+    voice/respond) filter deleted rows and return 404 to make "deleted"
+    indistinguishable from "never existed", which is the safer default
+    for write paths.
+    """
+    result = await db.execute(
+        select(Interview).where(Interview.id == str(interview_id))
+    )
+    interview = result.scalar_one_or_none()
+    if interview is None:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if interview.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your interview")
+    if interview.deleted_at is not None:
+        raise HTTPException(status_code=410, detail="Interview was deleted")
+
+    interview.is_favorite = not bool(interview.is_favorite)
+    await db.commit()
+    await db.refresh(interview)
+
+    return {
+        "interview_id": str(interview.id),
+        "is_favorite": interview.is_favorite,
+    }
+
+
+@router.delete("/{interview_id}")
+async def soft_delete_interview(
+    interview_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete: set deleted_at, keep the row for audit / undo.
+
+    Idempotent — re-deleting an already-deleted interview is a no-op (200
+    with already_deleted=True) rather than a 404, so client retries don't
+    surface confusing errors. Like /favorite, this endpoint does NOT
+    filter deleted_at in the WHERE clause so the idempotency check works.
+    """
+    from datetime import datetime, timezone
+    result = await db.execute(
+        select(Interview).where(Interview.id == str(interview_id))
+    )
+    interview = result.scalar_one_or_none()
+    if interview is None:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if interview.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your interview")
+
+    was_already = interview.deleted_at is not None
+    if not was_already:
+        interview.deleted_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(interview)
+
+    return {
+        "interview_id": str(interview.id),
+        "deleted": True,
+        "already_deleted": was_already,
+        "deleted_at": interview.deleted_at.isoformat() if interview.deleted_at else None,
+    }
 
 
 @router.post("", response_model=InterviewOut)
@@ -95,6 +250,26 @@ async def start_interview(
     profile = result.scalar_one_or_none()
     if not profile:
         raise HTTPException(status_code=400, detail="Profile not found")
+
+    # Dedup: if this user already has an in_progress interview for the same
+    # (round, style), return it instead of creating a new one. Prevents the
+    # double/triple POST pattern from React StrictMode + double-mount + room
+    # page ignoring the `?id=` query param.
+    existing = await db.execute(
+        select(Interview)
+        .where(
+            Interview.user_id == user.id,
+            Interview.round == data.round,
+            Interview.style == data.style,
+            Interview.status == "in_progress",
+            Interview.deleted_at.is_(None),
+        )
+        .order_by(Interview.started_at.desc())
+        .limit(1)
+    )
+    existing_iv = existing.scalar_one_or_none()
+    if existing_iv is not None:
+        return existing_iv
 
     interview = Interview(
         user_id=user.id,
@@ -145,6 +320,7 @@ async def get_interview(
         select(Interview).where(
             Interview.id == str(interview_id),
             Interview.user_id == user.id,
+            Interview.deleted_at.is_(None),
         )
     )
     interview = result.scalar_one_or_none()
@@ -177,6 +353,7 @@ async def get_next_question(
         select(Interview).where(
             Interview.id == str(interview_id),
             Interview.user_id == user.id,
+            Interview.deleted_at.is_(None),
         )
     )
     interview = interview_result.scalar_one_or_none()
@@ -229,7 +406,7 @@ async def get_next_question(
 
     record = QuestionRecord(
         interview_id=str(interview_id),
-        question_id=None,  # seed data uses semantic IDs, not UUIDs
+        question_id=next_q.get("id"),  # semantic ID like "agent_001" — not a UUID
         question_text=question_text,
     )
     db.add(record)
@@ -247,6 +424,87 @@ async def get_next_question(
         "sub_topic": next_q.get("sub_topic", ""),
         "followup_tree": next_q.get("followup_tree", {}),
         "asked_count": asked_count,
+    }
+
+
+@router.post("/{interview_id}/complete")
+async def complete_interview(
+    interview_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """User-initiated end of interview. Idempotent — already-completed returns 200.
+
+    Differs from the auto-complete path inside /next-question (which fires when
+    the question pool is exhausted): this is called from the UI when the user
+    clicks "结束面试" before running out of questions.
+    """
+    from datetime import datetime, timezone
+
+    result = await db.execute(
+        select(Interview).where(
+            Interview.id == str(interview_id),
+            Interview.deleted_at.is_(None),
+        )
+    )
+    interview = result.scalar_one_or_none()
+    if interview is None:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if interview.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your interview")
+
+    was_already = interview.status == "completed"
+    if not was_already:
+        interview.status = "completed"
+        interview.ended_at = datetime.now(timezone.utc)
+
+        # ── Compute overall_score from QuestionRecord.score average ──
+        # Replaces the stub of "always 3". Only counts scored records
+        # (intro phase doesn't produce a QuestionRecord; skip_and_record
+        # follows the same /voice/respond path so it does).
+        score_q = await db.execute(
+            select(func.avg(QuestionRecord.score)).where(
+                QuestionRecord.interview_id == str(interview_id),
+                QuestionRecord.score.is_not(None),
+            )
+        )
+        avg = score_q.scalar()
+        if avg is not None:
+            interview.overall_score = round(float(avg), 2)
+
+        # ── Compute total_questions: distinct non-null question_ids ──
+        # Single source of truth: the records we already persisted. Counts
+        # distinct questions (a Q with N followups = 1, not N+1). NULL
+        # question_id is excluded — those are edge-case records created
+        # before a real question was selected.
+        count_q = await db.execute(
+            select(func.count(func.distinct(QuestionRecord.question_id))).where(
+                QuestionRecord.interview_id == str(interview_id),
+                QuestionRecord.question_id.is_not(None),
+            )
+        )
+        total = count_q.scalar() or 0
+        if total > 0:
+            interview.total_questions = total
+
+        await db.commit()
+        await db.refresh(interview)
+
+        # Best-effort: kill the LiveKit worker if one was started for this
+        # interview. The WS path doesn't spawn one, so this is a no-op for
+        # WS users. We don't fail /complete on cleanup errors.
+        try:
+            _stop_voice_worker(str(interview_id))
+        except Exception as e:
+            logger.warning(f"stop_voice_worker failed for {interview_id}: {e}")
+
+    return {
+        "status": "completed",
+        "already_completed": was_already,
+        "interview_id": str(interview.id),
+        "ended_at": interview.ended_at.isoformat() if interview.ended_at else None,
+        "overall_score": interview.overall_score,
+        "total_questions": interview.total_questions,
     }
 
 
@@ -420,6 +678,14 @@ async def voice_respond(
         next_q = question_engine.select_next_question(
             round="round1", profile=state["profile"], questions_asked=[], blind_spots=[])
         if next_q:
+            # Transition intro → questioning. Without these two writes (and the
+            # matching session_manager.set_state below) every subsequent call
+            # would loop back through the intro branch — never producing
+            # followups or persisting QuestionRecord rows.
+            state["current_question"] = next_q
+            state["current_question_id"] = next_q.get("id")
+            state["interview_phase"] = "questioning"
+            session_manager.set_state(data.interview_id, state)
             response = persona.wrap({"action": "next_question", "question_text": next_q["question_text"]})
         else:
             response = persona.wrap({"action": "next_question", "question_text": "请简单说一下你对 AI Agent 架构的理解？"})
@@ -443,6 +709,64 @@ async def voice_respond(
                 round=state.get("round", "round1"), profile=state["profile"],
                 questions_asked=state.get("questions_asked", []), blind_spots=state.get("blind_spots", []))
             response = persona.wrap({"action": "next_question", "question_text": nq["question_text"] if nq else "面试结束！"})
+
+        # ── Persist: find/create QuestionRecord, save answer + evaluation ──
+        # Until now the WS path threw the answer away. Mirror what
+        # /records/{id}/answer does on the HTTP path: write the user text,
+        # run the evaluator, store score/blind_spots so the report + history
+        # pages can show real data.
+        try:
+            question_id = str(q.get("id", "")) or None
+            question_text = q.get("question_text", "") or ""
+
+            # Find an existing record for this question (idempotent on retries)
+            existing = None
+            if question_id:
+                qr = await db.execute(
+                    select(QuestionRecord).where(
+                        QuestionRecord.interview_id == data.interview_id,
+                        QuestionRecord.question_id == question_id,
+                    )
+                )
+                existing = qr.scalar_one_or_none()
+
+            if existing is None:
+                existing = QuestionRecord(
+                    interview_id=data.interview_id,
+                    question_id=question_id,
+                    question_text=question_text,
+                )
+                db.add(existing)
+
+            existing.user_answer = data.user_answer
+
+            # Evaluate — only on the first answer for a question to avoid
+            # re-scoring the same text every followup turn.
+            if existing.score is None:
+                evaluation = await evaluate_agent.evaluate_answer(
+                    question_text=question_text,
+                    answer_key_points=q.get("answer_key_points", []),
+                    user_answer=data.user_answer,
+                    topic=q.get("topic", ""),
+                    sub_topic=q.get("sub_topic", ""),
+                )
+                existing.score = evaluation.get("score", 3)
+                existing.blind_spots = evaluation.get("blind_spots", [])
+
+            await db.commit()
+        except Exception as e:
+            # Persistence failure shouldn't break the live interview — just log
+            logger.warning(f"voice_respond persist failed: {e}")
+            await db.rollback()
+
+        # Write the in-memory state back — `get_state` returned a shallow
+        # copy, so the followup_agent-induced mutations (blind_spots,
+        # current_depth, followup_count) would otherwise be discarded.
+        # session_manager.set_state is the only safe write-back path.
+        try:
+            session_manager.set_state(data.interview_id, state)
+        except Exception as e:
+            logger.warning(f"voice_respond set_state failed: {e}")
 
     return {"response": response}
 
