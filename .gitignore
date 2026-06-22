@@ -32,3 +32,12 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# Local dev DBs (project uses MySQL, leftover SQLite from earlier dev)
+backend/dev.db
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Claude Code sub-agent config (NOT skills themselves)
+.agents/worktrees/
