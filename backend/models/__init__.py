@@ -453,3 +453,26 @@ class QuestionProgressArchive(Base):
     __table_args__ = (
         Index("idx_qpa_user_status", "user_id", "status"),
     )
+
+
+class QASession(Base):
+    """题库问答 session。每个 session 针对一道题, 含多轮 user/assistant 消息。
+
+    设计决策: 消息存 JSON (不分子表), 因为:
+    - 单 session 消息数 < 100 (1v1 模拟面试场景)
+    - JSON 让 history 1 次 round-trip 拉完
+    """
+
+    __tablename__ = "qa_sessions"
+
+    id = Column(String(36), primary_key=True, default=_new_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    question_id = Column(String(64), nullable=False, index=True)
+    messages = Column(JSON, default=list, nullable=False)
+    # [{role: user/assistant, content, ts: iso}, ...]
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_qas_user_question", "user_id", "question_id"),
+        Index("idx_qas_user_created", "user_id", "created_at"),
+    )
