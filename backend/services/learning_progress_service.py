@@ -307,11 +307,7 @@ async def get_recommend(
     """
     import random
 
-    # 1. weak topics
-    profile = (await db.execute(
-        select(func.json_extract).select_from(func)  # placeholder
-    ))
-    # 简化: 直接从 profile 字段读
+    # 1. weak topics (从 Profile 字段读)
     from models import Profile
     prof = (await db.execute(
         select(Profile).where(Profile.user_id == user_id)
