@@ -26,6 +26,7 @@ export interface QuestionListItem {
   question_text: string;
   source: QuestionSource;
   progress: QuestionProgress | null;
+  tags?: string[];
 }
 
 export interface QuestionDetail {
@@ -305,8 +306,9 @@ export interface QASessionListResponse {
 }
 
 export interface QAChatInput {
-  session_id?: string;           // 不传则新建会话
-  question: string;
+  session_id?: string | null;   // 不传则新建会话
+  question_id: string;
+  message: string;
 }
 
 export interface QAChatResponse {

@@ -1,4 +1,5 @@
 import '@testing-library/jest-dom/vitest';
+import { vi } from 'vitest';
 
 // Mock Next.js router (避免引入 next/router 真实模块)
 vi.mock('next/router', () => ({
